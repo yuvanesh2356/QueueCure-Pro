@@ -1,0 +1,109 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAnonymous() {
+      return request.auth != null && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
+    function isStaff() {
+      return isAuthenticated() && !isAnonymous();
+    }
+
+    function isClinicStaff(clinicId) {
+      return isStaff() &&
+        exists(/databases/$(database)/documents/clinics/$(clinicId)/staff/$(request.auth.uid));
+    }
+
+    function hasClinicRole(clinicId, role) {
+      return isClinicStaff(clinicId) &&
+        get(/databases/$(database)/documents/clinics/$(clinicId)/staff/$(request.auth.uid)).data.role == role;
+    }
+
+    function isReceptionist(clinicId) {
+      return hasClinicRole(clinicId, 'receptionist');
+    }
+
+    function isDoctor(clinicId) {
+      return hasClinicRole(clinicId, 'doctor');
+    }
+
+    function isAdmin(clinicId) {
+      return hasClinicRole(clinicId, 'admin');
+    }
+
+    function isReceptionistOrAdmin(clinicId) {
+      return isReceptionist(clinicId) || isAdmin(clinicId);
+    }
+
+    function isStaffMember(clinicId) {
+      return isReceptionistOrAdmin(clinicId) || isDoctor(clinicId);
+    }
+
+    function isOwnDoctorDoc(clinicId, doctorId) {
+      return isDoctor(clinicId) &&
+        get(/databases/$(database)/documents/clinics/$(clinicId)/staff/$(request.auth.uid)).data.doctorId == doctorId;
+    }
+
+    // ─── CLINIC ROOT ──────────────────────────────────────────────────────────
+
+    match /clinics/{clinicId} {
+      allow read:   if isStaffMember(clinicId);
+      allow create: if isStaff();
+      allow update: if isAdmin(clinicId);
+      allow delete: if false;
+
+      // ─── STAFF SUBCOLLECTION ────────────────────────────────────────────────
+      match /staff/{userId} {
+        allow read:   if isAuthenticated() && (request.auth.uid == userId || isAdmin(clinicId));
+        allow create: if isAdmin(clinicId) || (isStaff() && !exists(/databases/$(database)/documents/clinics/$(clinicId)/staff/$(request.auth.uid)));
+        allow update: if isAdmin(clinicId) || request.auth.uid == userId;
+        allow delete: if isAdmin(clinicId);
+      }
+
+      // ─── DOCTORS SUBCOLLECTION ──────────────────────────────────────────────
+      match /doctors/{doctorId} {
+        // Patients need to read doctor info to see queue lengths at check-in
+        allow read:   if isAuthenticated();
+        allow create: if isReceptionistOrAdmin(clinicId);
+        allow update: if isReceptionistOrAdmin(clinicId) || isOwnDoctorDoc(clinicId, doctorId);
+        allow delete: if isAdmin(clinicId);
+      }
+
+      // ─── TOKENS SUBCOLLECTION ───────────────────────────────────────────────
+      match /tokens/{tokenId} {
+        // Anonymous patients can read tokens (to see queue status)
+        allow read:   if isAuthenticated();
+        // Only staff can create tokens (QR check-in creates via receptionist role)
+        allow create: if isReceptionistOrAdmin(clinicId) || isAuthenticated();
+        // Receptionist/admin can update any token; doctor can only update currentToken
+        allow update: if isReceptionistOrAdmin(clinicId) ||
+                         (isDoctor(clinicId) &&
+                          request.resource.data.diff(resource.data).affectedKeys()
+                            .hasOnly(['status', 'consultationEndAt', 'actualConsultMinutes']));
+        allow delete: if false;
+      }
+
+      // ─── SESSIONS SUBCOLLECTION ─────────────────────────────────────────────
+      match /sessions/{sessionDate} {
+        allow read:   if isAuthenticated();
+        allow create: if isReceptionistOrAdmin(clinicId);
+        allow update: if isReceptionistOrAdmin(clinicId);
+        allow delete: if false;
+      }
+
+      // ─── SETTINGS ───────────────────────────────────────────────────────────
+      match /settings/{document} {
+        allow read:   if isAuthenticated();
+        allow write:  if isAdmin(clinicId);
+      }
+    }
+  }
+}
